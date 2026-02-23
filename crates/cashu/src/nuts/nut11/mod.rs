@@ -6,9 +6,11 @@ use std::collections::{HashMap, HashSet};
 use std::str::FromStr;
 use std::{fmt, vec};
 
+use bitcoin::consensus::Decodable;
 use bitcoin::hashes::sha256::Hash as Sha256Hash;
 use bitcoin::hashes::Hash;
 use bitcoin::secp256k1::schnorr::Signature;
+use bitcoin::Transaction;
 use serde::de::{DeserializeOwned, Error as DeserializerError};
 use serde::ser::SerializeSeq;
 use serde::{Deserialize, Deserializer, Serialize, Serializer};
@@ -98,6 +100,9 @@ pub enum Error {
     /// Secret error
     #[error(transparent)]
     Secret(#[from] crate::secret::Error),
+    /// BTCFEE transaction invalid
+    #[error("Invalid transaction data")]
+    InvalidTransaction,
 }
 
 /// P2Pk Witness
@@ -338,6 +343,15 @@ pub enum SpendingConditions {
         /// Additional Optional Spending [`Conditions`]
         conditions: Option<Conditions>,
     },
+    /// NUTXX Spending conditions
+    ///
+    /// Defined in [NUTXX](https://github.com/TheMhv/nuts/blob/feat/external-fee/xx.md)
+    BTCFEEConditions {
+        /// The transaction that be include in mempool
+        data: Transaction,
+        /// Additional Optional Spending [`Conditions`]
+        conditions: Option<Conditions>,
+    },
 }
 
 impl SpendingConditions {
@@ -382,6 +396,7 @@ impl SpendingConditions {
         match self {
             Self::P2PKConditions { .. } => Kind::P2PK,
             Self::HTLCConditions { .. } => Kind::HTLC,
+            Self::BTCFEEConditions { .. } => Kind::BTCFEE,
         }
     }
 
@@ -390,6 +405,7 @@ impl SpendingConditions {
         match self {
             Self::P2PKConditions { conditions, .. } => conditions.as_ref().and_then(|c| c.num_sigs),
             Self::HTLCConditions { conditions, .. } => conditions.as_ref().and_then(|c| c.num_sigs),
+            Self::BTCFEEConditions { .. } => None,
         }
     }
 
@@ -406,6 +422,7 @@ impl SpendingConditions {
                 Some(unique_pubkeys.into_iter().collect())
             }
             Self::HTLCConditions { conditions, .. } => conditions.clone().and_then(|c| c.pubkeys),
+            Self::BTCFEEConditions { .. } => None,
         }
     }
 
@@ -414,6 +431,9 @@ impl SpendingConditions {
         match self {
             Self::P2PKConditions { conditions, .. } => conditions.as_ref().and_then(|c| c.locktime),
             Self::HTLCConditions { conditions, .. } => conditions.as_ref().and_then(|c| c.locktime),
+            Self::BTCFEEConditions { conditions, .. } => {
+                conditions.as_ref().and_then(|c| c.locktime)
+            }
         }
     }
 
@@ -424,6 +444,9 @@ impl SpendingConditions {
                 conditions.clone().and_then(|c| c.refund_keys)
             }
             Self::HTLCConditions { conditions, .. } => {
+                conditions.clone().and_then(|c| c.refund_keys)
+            }
+            Self::BTCFEEConditions { conditions, .. } => {
                 conditions.clone().and_then(|c| c.refund_keys)
             }
         }
@@ -458,6 +481,14 @@ impl TryFrom<Nut10Secret> for SpendingConditions {
                     .tags()
                     .and_then(|t| t.clone().try_into().ok()),
             }),
+            Kind::BTCFEE => Ok(Self::BTCFEEConditions {
+                data: Decodable::consensus_decode(&mut secret.secret_data().data().as_bytes())
+                    .map_err(|_| Error::InvalidTransaction)?,
+                conditions: secret
+                    .secret_data()
+                    .tags()
+                    .and_then(|t| t.clone().try_into().ok()),
+            }),
         }
     }
 }
@@ -471,6 +502,11 @@ impl From<SpendingConditions> for super::nut10::Secret {
             SpendingConditions::HTLCConditions { data, conditions } => {
                 super::nut10::Secret::new(Kind::HTLC, data.to_string(), conditions)
             }
+            SpendingConditions::BTCFEEConditions { data, conditions } => super::nut10::Secret::new(
+                Kind::BTCFEE,
+                serde_json::to_string(&data).unwrap(),
+                conditions,
+            ),
         }
     }
 }

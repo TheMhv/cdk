@@ -1,4 +1,4 @@
-//! NUT-26: Bech32m encoding for payment requests  
+//! NUT-26: Bech32m encoding for payment requests
 //!
 //! This module provides bech32m encoding and decoding functionality for Cashu payment requests,
 //! implementing the CREQ-B format using TLV (Tag-Length-Value) encoding as specified in NUT-26.
@@ -625,6 +625,7 @@ impl PaymentRequest {
         let kind_val = match nut10.kind {
             Kind::P2PK => 0u8,
             Kind::HTLC => 1u8,
+            Kind::BTCFEE => 2u8,
         };
         writer.write_tlv(0x01, &[kind_val]);
 

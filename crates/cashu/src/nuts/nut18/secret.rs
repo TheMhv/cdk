@@ -58,6 +58,11 @@ impl From<SpendingConditions> for Nut10SecretRequest {
             SpendingConditions::HTLCConditions { data, conditions } => {
                 Self::new(Kind::HTLC, data.to_string(), conditions)
             }
+            SpendingConditions::BTCFEEConditions { data, conditions } => Self::new(
+                Kind::BTCFEE,
+                serde_json::to_string(&data).unwrap(),
+                conditions,
+            ),
         }
     }
 }
