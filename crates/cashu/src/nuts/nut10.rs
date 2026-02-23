@@ -57,6 +57,8 @@ pub enum Kind {
     P2PK,
     /// NUT-14 HTLC
     HTLC,
+    /// NUT-XX BTCFEE
+    BTCFEE,
 }
 
 /// Secret Date
@@ -257,6 +259,36 @@ pub(crate) fn get_pubkeys_and_required_sigs(
                 refund_path,
             })
         }
+        Kind::BTCFEE => {
+            // BTCFEE: receiver path (preimage + pubkeys) is ALWAYS available per NUT-XX
+            // "This pathway is ALWAYS available to the receivers"
+            let pubkeys = conditions.pubkeys.clone().unwrap_or_default();
+
+            // Refund path is available after locktime
+            let refund_path = if locktime_passed {
+                if let Some(refund_keys) = &conditions.refund_keys {
+                    Some(RefundPath {
+                        pubkeys: refund_keys.clone(),
+                        required_sigs: conditions.num_sigs_refund.unwrap_or(1),
+                    })
+                } else {
+                    // Locktime passed, no refund keys: anyone can spend via refund path
+                    Some(RefundPath {
+                        pubkeys: vec![],
+                        required_sigs: 0,
+                    })
+                }
+            } else {
+                None
+            };
+
+            Ok(SpendingRequirements {
+                preimage_needed: true,
+                pubkeys,
+                required_sigs: 0,
+                refund_path,
+            })
+        }
     }
 }
 
@@ -337,6 +369,9 @@ pub trait SpendingConditionVerification {
                         .map(|c| c.sig_flag == super::SigFlag::SigAll)
                         .unwrap_or(false),
                     super::SpendingConditions::HTLCConditions { conditions, .. } => conditions
+                        .map(|c| c.sig_flag == super::SigFlag::SigAll)
+                        .unwrap_or(false),
+                    super::SpendingConditions::BTCFEEConditions { conditions, .. } => conditions
                         .map(|c| c.sig_flag == super::SigFlag::SigAll)
                         .unwrap_or(false),
                 };
@@ -451,6 +486,7 @@ pub trait SpendingConditionVerification {
             Kind::HTLC => {
                 self.verify_sig_all_htlc()?;
             }
+            Kind::BTCFEE => (),
         }
 
         Ok(())
@@ -486,6 +522,7 @@ pub trait SpendingConditionVerification {
                     Kind::HTLC => {
                         proof.verify_htlc()?;
                     }
+                    Kind::BTCFEE => (),
                 }
             }
             // If not a nut10 secret, skip verification (plain secret)
