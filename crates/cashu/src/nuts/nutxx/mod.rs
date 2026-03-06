@@ -9,3 +9,7 @@ pub use error::Error;
 /// BTCFEE Witness module
 pub mod witness;
 pub use witness::Witness;
+
+/// BTCFEE Spending Conditions module
+pub mod spending_conditions;
+pub use spending_conditions::SpendingConditions;
