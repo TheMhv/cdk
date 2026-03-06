@@ -30,6 +30,7 @@ use crate::nuts::nut01::SecretKey;
 use crate::nuts::nut11::{serde_p2pk_witness, P2PKWitness};
 use crate::nuts::nut12::BlindSignatureDleq;
 use crate::nuts::nut14::{serde_htlc_witness, HTLCWitness};
+use crate::nuts::nutxx::{serde_btcfee_witness, Witness as BTCFEEWitness};
 use crate::nuts::{Id, ProofDleq};
 use crate::secret::Secret;
 use crate::Amount;
@@ -287,6 +288,9 @@ pub enum Witness {
     /// P2PK Witness
     #[serde(with = "serde_p2pk_witness")]
     P2PKWitness(P2PKWitness),
+    /// BTCFEE Witness
+    #[serde(with = "serde_btcfee_witness")]
+    BTCFEEWitness(BTCFEEWitness),
 }
 
 impl From<P2PKWitness> for Witness {
@@ -310,6 +314,7 @@ impl Witness {
                 Some(sigs) => sigs.extend(signatures),
                 None => htlc_witness.signatures = Some(signatures),
             },
+            Self::BTCFEEWitness(_btcfee_witness) => {}
         }
     }
 
@@ -318,6 +323,7 @@ impl Witness {
         match self {
             Self::P2PKWitness(witness) => Some(witness.signatures.clone()),
             Self::HTLCWitness(witness) => witness.signatures.clone(),
+            Self::BTCFEEWitness(_witness) => None,
         }
     }
 
@@ -326,6 +332,7 @@ impl Witness {
         match self {
             Self::P2PKWitness(_witness) => None,
             Self::HTLCWitness(witness) => Some(witness.preimage.clone()),
+            Self::BTCFEEWitness(witness) => Some(witness.preimage.clone()),
         }
     }
 }

@@ -13,3 +13,5 @@ pub use witness::Witness;
 /// BTCFEE Spending Conditions module
 pub mod spending_conditions;
 pub use spending_conditions::SpendingConditions;
+
+pub mod serde_btcfee_witness;
