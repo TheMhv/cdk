@@ -1,5 +1,6 @@
 //! Cashu utils
 
+pub mod bitcoin_rpc;
 pub mod hex;
 pub mod serde_helpers;
 
