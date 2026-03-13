@@ -28,21 +28,8 @@ pub mod serde_p2pk_witness;
 pub mod error;
 pub use error::Error;
 
-/// P2Pk Witness
-#[derive(Default, Debug, Clone, PartialEq, Eq, Hash, Serialize, Deserialize)]
-#[cfg_attr(feature = "swagger", derive(utoipa::ToSchema))]
-pub struct P2PKWitness {
-    /// Signatures
-    pub signatures: Vec<String>,
-}
-
-impl P2PKWitness {
-    #[inline]
-    /// Check id Witness is empty
-    pub fn is_empty(&self) -> bool {
-        self.signatures.is_empty()
-    }
-}
+pub mod witness;
+pub use witness::P2PKWitness;
 
 impl Proof {
     /// Sign [Proof]
