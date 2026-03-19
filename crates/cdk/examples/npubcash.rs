@@ -62,13 +62,13 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
     let mut full_seed = [0u8; 64];
     full_seed[..32].copy_from_slice(&seed);
 
-    let wallet = Arc::new(Wallet::new(
+    let wallet = Wallet::new(
         &mint_url,
         CurrencyUnit::Sat,
         Arc::new(localstore),
         full_seed,
         None,
-    )?);
+    )?;
 
     // Enable NpubCash integration
     let npubcash_url = NPUBCASH_URL.to_string();
