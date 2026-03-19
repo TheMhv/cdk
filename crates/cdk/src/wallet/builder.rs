@@ -199,7 +199,7 @@ impl WalletBuilder {
     }
 
     /// Build the wallet
-    pub fn build(self) -> Result<Wallet, Error> {
+    pub fn build(self) -> Result<Arc<Wallet>, Error> {
         let mint_url = self
             .mint_url
             .ok_or(Error::Custom("Mint url required".to_string()))?;
@@ -231,7 +231,7 @@ impl WalletBuilder {
             }
         });
 
-        Ok(Wallet {
+        Ok(Arc::new(Wallet {
             mint_url,
             unit,
             localstore,
@@ -244,7 +244,7 @@ impl WalletBuilder {
             seed,
             client: client.clone(),
             subscription: SubscriptionManager::new(client, self.use_http_subscription),
-        })
+        }))
     }
 }
 

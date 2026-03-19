@@ -237,7 +237,7 @@ impl Wallet {
         localstore: Arc<dyn WalletDatabase<database::Error> + Send + Sync>,
         seed: [u8; 64],
         target_proof_count: Option<usize>,
-    ) -> Result<Self, Error> {
+    ) -> Result<Arc<Self>, Error> {
         let mint_url = MintUrl::from_str(mint_url)?;
 
         WalletBuilder::new()

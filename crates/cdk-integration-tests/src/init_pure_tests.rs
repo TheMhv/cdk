@@ -399,7 +399,7 @@ pub async fn create_mint_with_limits(limits: Option<(usize, usize)>) -> Result<M
     Ok(mint)
 }
 
-pub async fn create_test_wallet_for_mint(mint: Mint) -> Result<Wallet> {
+pub async fn create_test_wallet_for_mint(mint: Mint) -> Result<Arc<Wallet>> {
     let connector = DirectMintConnection::new(mint.clone());
 
     let mint_info = mint.mint_info().await?;

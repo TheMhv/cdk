@@ -55,9 +55,7 @@ impl Wallet {
             .build()
             .map_err(FfiError::from)?;
 
-        Ok(Self {
-            inner: Arc::new(wallet),
-        })
+        Ok(Self { inner: wallet })
     }
 
     /// Get the mint URL

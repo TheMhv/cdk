@@ -371,7 +371,7 @@ pub fn test_mint_quote(mint_url: MintUrl) -> MintQuote {
 /// Create a test wallet
 pub async fn create_test_wallet(
     db: Arc<dyn WalletDatabase<cdk_common::database::Error> + Send + Sync>,
-) -> Wallet {
+) -> Arc<Wallet> {
     let mint_url = "https://test-mint.example.com";
     let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
 
@@ -382,7 +382,7 @@ pub async fn create_test_wallet(
 pub async fn create_test_wallet_with_mock(
     db: Arc<dyn WalletDatabase<cdk_common::database::Error> + Send + Sync>,
     mock_client: Arc<MockMintConnector>,
-) -> Wallet {
+) -> Arc<Wallet> {
     let seed = Mnemonic::generate(12).unwrap().to_seed_normalized("");
 
     crate::wallet::WalletBuilder::new()
