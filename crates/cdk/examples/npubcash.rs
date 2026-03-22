@@ -97,7 +97,9 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
 
     // Subscribe to quote updates and wait for the single payment
     let mut stream =
-        wallet.npubcash_proof_stream(SplitTarget::default(), None, Duration::from_secs(5));
+        wallet
+            .clone()
+            .npubcash_proof_stream(SplitTarget::default(), None, Duration::from_secs(5));
 
     if let Some(result) = stream.next().await {
         match result {
