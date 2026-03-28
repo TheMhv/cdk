@@ -4,6 +4,7 @@
 //! during melt operations.
 
 use std::str::FromStr;
+use std::sync::Arc;
 
 use cdk_common::dhke::construct_proofs;
 use cdk_common::melt::MeltQuoteRequest;
@@ -128,7 +129,7 @@ async fn test_htlc_sig_all_requiring_preimage_and_one_signature() {
     );
     println!("✓ Melting with ONLY preimage failed verification as expected");
 
-    let melt_result = mint.melt(&melt_request_preimage_only).await;
+    let melt_result = Arc::clone(&mint).melt(&melt_request_preimage_only).await;
     assert!(
         melt_result.is_err(),
         "Actual melt should also fail with only preimage"
@@ -157,7 +158,7 @@ async fn test_htlc_sig_all_requiring_preimage_and_one_signature() {
     );
     println!("✓ Melting with SIG_INPUTS signatures failed verification as expected");
 
-    let melt_result = mint.melt(&melt_request_sig_inputs).await;
+    let melt_result = Arc::clone(&mint).melt(&melt_request_sig_inputs).await;
     assert!(
         melt_result.is_err(),
         "Actual melt should also fail with SIG_INPUTS signatures"
