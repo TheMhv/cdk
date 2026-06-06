@@ -7,6 +7,8 @@ use crate::error::Error;
 pub mod bitcoin_rpc;
 #[cfg(feature = "esplora")]
 pub mod esplora;
+#[cfg(feature = "floresta")]
+pub mod floresta;
 
 /// Configuration for connecting to Bitcoin RPC
 #[derive(Debug, Clone)]
@@ -39,6 +41,8 @@ pub enum ChainSource {
     /// Use Bitcoin Core RPC for blockchain data
     #[cfg(feature = "bitcoin-rpc")]
     BitcoinRpc(BitcoinRpcConfig),
+    #[cfg(feature = "floresta")]
+    Floresta(),
 }
 
 /// Classified result of submitting a transaction to a chain backend.
@@ -91,6 +95,7 @@ impl ChainSource {
             ChainSource::BitcoinRpc(config) => {
                 bitcoin_rpc::sync_bitcoin_rpc(cdk_bdk, config, cancel_token).await
             }
+            ChainSource::Floresta() => floresta::sync_floresta(cdk_bdk, cancel_token).await,
             #[allow(unreachable_patterns)]
             _ => unreachable!("ChainSource must have at least one feature enabled"),
         }
