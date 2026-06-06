@@ -427,7 +427,7 @@ impl Mint {
         signatures: Vec<Signature>,
     ) -> Result<Vec<MintQuoteResponse<QuoteId>>, Error> {
         #[cfg(feature = "prometheus")]
-        let metrics = super::MintMetricGuard::new("mint_quotes");
+        let metrics = super::MintMetricGuard::new("mint_quotes_by_pubkeys");
 
         pubkeys.len().ne(&signatures.len()).then(|| {
             tracing::error!("Signatures must be the same length of publickeys");
