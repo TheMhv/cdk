@@ -240,8 +240,14 @@ impl BlindSignature {
     pub fn add_dleq_proof(
         &mut self,
         blinded_message: &PublicKey,
-        mint_secretkey: &SecretKey,
+        mint_secretkey: Option<&SecretKey>,
     ) -> Result<(), Error> {
+        // TODO (@TheMhv) get the mint secret key
+        let mint_secretkey = match mint_secretkey {
+            Some(v) => v,
+            None => &SecretKey::generate(),
+        };
+
         let dleq: BlindSignatureDleq = calculate_dleq(self.c, blinded_message, mint_secretkey)?;
         self.dleq = Some(dleq);
         Ok(())
@@ -473,7 +479,7 @@ mod tests {
 
         // Add DLEQ proof
         blind_sig
-            .add_dleq_proof(&blinded_message, &secret_key)
+            .add_dleq_proof(&blinded_message, Some(&secret_key))
             .unwrap();
 
         // After adding, DLEQ should be Some

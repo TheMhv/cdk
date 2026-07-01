@@ -18,21 +18,27 @@ use crate::{column_as_number, column_as_string, unpack_into};
 pub(crate) fn sql_row_to_blind_signature(row: Vec<Column>) -> Result<BlindSignature, Error> {
     unpack_into!(
         let (
-            keyset_id, amount, c
+            keyset_id, amount, c, blinded_message
         ) = row
     );
 
-    // TODO (@TheMhv): recalculate dleq proof
-    let dleq = None;
-
     let amount: u64 = column_as_number!(amount);
 
-    Ok(BlindSignature {
+    let mut blinded_signature = BlindSignature {
         amount: Amount::from(amount),
         keyset_id: column_as_string!(keyset_id, Id::from_str, Id::from_bytes),
         c: column_as_string!(c, PublicKey::from_hex, PublicKey::from_slice),
-        dleq,
-    })
+        dleq: None,
+    };
+
+    // TODO (@TheMhv): recalculate dleq proof
+    let blinded_message =
+        column_as_string!(blinded_message, PublicKey::from_hex, PublicKey::from_slice);
+    blinded_signature
+        .add_dleq_proof(&blinded_message, None)
+        .map_err(|_| Error::Internal("Unable to add DLEQ proof".to_string()))?;
+
+    Ok(blinded_signature)
 }
 
 #[async_trait]
@@ -207,10 +213,10 @@ where
         .fetch_all(&self.inner)
         .await?
         .into_iter()
-        .map(|mut row| {
+        .map(|row| {
             Ok((
                 column_as_string!(
-                    &row.pop().ok_or(Error::InvalidDbResponse)?,
+                    &row.last().ok_or(Error::InvalidDbResponse)?,
                     PublicKey::from_hex,
                     PublicKey::from_slice
                 ),
@@ -262,10 +268,10 @@ where
         .fetch_all(&*conn)
         .await?
         .into_iter()
-        .map(|mut row| {
+        .map(|row| {
             Ok((
                 column_as_string!(
-                    &row.pop().ok_or(Error::InvalidDbResponse)?,
+                    &row.last().ok_or(Error::InvalidDbResponse)?,
                     PublicKey::from_hex,
                     PublicKey::from_slice
                 ),
@@ -293,7 +299,8 @@ where
             SELECT
                 keyset_id,
                 amount,
-                c
+                c,
+                blinded_message
             FROM
                 blind_signature
             WHERE
@@ -323,7 +330,8 @@ where
             SELECT
                 keyset_id,
                 amount,
-                c
+                c,
+                blinded_message
             FROM
                 blind_signature
             WHERE
