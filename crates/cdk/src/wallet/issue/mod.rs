@@ -760,11 +760,19 @@ impl Wallet {
         }
         let deduped_keys: Vec<SecretKey> = requested.values().cloned().collect();
 
-        let mint_pubkey = self
-            .load_mint_info()
-            .await?
-            .pubkey
-            .ok_or(Error::MissingPubkey)?;
+        let mint_pubkey = match self.load_mint_info().await?.pubkey {
+            Some(pubkey) => pubkey,
+            None => {
+                // A cached mint record can lack a pubkey while still counting as fresh:
+                // it may predate the mint advertising one, or hold it in a legacy format
+                // the row parser silently drops. Refresh from the mint once before
+                // concluding the lookup is unsupported.
+                self.fetch_mint_info()
+                    .await?
+                    .and_then(|info| info.pubkey)
+                    .ok_or(Error::MissingPubkey)?
+            }
+        };
 
         let request =
             build_mint_quote_by_pubkey_request(&mint_pubkey, &deduped_keys, only_mintable)?;
@@ -898,7 +906,8 @@ mod tests {
 
     use super::*;
     use crate::wallet::test_utils::{
-        create_test_db, create_test_wallet_with_mock, MockMintConnector,
+        create_test_db, create_test_wallet_with_mock, test_keyset, test_mint_info, test_mint_url,
+        MockMintConnector,
     };
 
     #[test]
@@ -1047,6 +1056,89 @@ mod tests {
         assert!(
             captured[1].only_mintable,
             "only_mintable: true must reach the request"
+        );
+    }
+
+    /// Seed the localstore like a wallet whose cached mint record predates the mint's
+    /// pubkey (or holds it in a format the row parser drops): info without a pubkey plus
+    /// a keyset, which is what marks the database cache populated.
+    async fn seed_stale_mint_record(
+        db: &std::sync::Arc<
+            dyn cdk_common::database::WalletDatabase<cdk_common::database::Error> + Send + Sync,
+        >,
+    ) {
+        let mut stale_info = test_mint_info();
+        stale_info.pubkey = None;
+        db.add_mint(test_mint_url(), Some(stale_info))
+            .await
+            .expect("seed mint info");
+        let ks = test_keyset();
+        db.add_mint_keysets(
+            test_mint_url(),
+            vec![crate::nuts::KeySetInfo {
+                id: ks.id,
+                unit: ks.unit.clone(),
+                active: true,
+                input_fee_ppk: 0,
+                final_expiry: None,
+            }],
+        )
+        .await
+        .expect("seed keysets");
+    }
+
+    /// A stored mint record without a pubkey must trigger one forced refresh from the
+    /// mint instead of failing the lookup outright: such a record otherwise satisfies
+    /// the metadata cache, so without the refresh the lookup would starve forever even
+    /// though the live mint advertises a pubkey.
+    #[tokio::test]
+    async fn fetch_mint_quotes_by_pubkey_refreshes_cached_mint_info_without_pubkey() {
+        let db = create_test_db().await;
+        seed_stale_mint_record(&db).await;
+
+        let mock = Arc::new(MockMintConnector::new());
+        // The refresh goes through `fetch_mint_info`, which enforces mint-clock tolerance;
+        // clear the canned info's fixed `time` so the mock isn't rejected as skewed.
+        mock.mint_info.lock().unwrap().time = None;
+        let wallet = create_test_wallet_with_mock(db, mock.clone()).await;
+
+        let secret_key = SecretKey::generate();
+        mock.set_mint_quote_by_pubkey_response(Ok(Vec::new()));
+        wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key), false)
+            .await
+            .expect("a stale cached mint record must not starve the lookup");
+
+        assert!(
+            *mock.get_mint_info_calls.lock().unwrap() >= 1,
+            "the wallet must refresh mint info from the mint when the cached pubkey is absent"
+        );
+    }
+
+    /// The refresh is a single attempt, not a mask: when the mint genuinely advertises
+    /// no pubkey, the lookup still fails with `MissingPubkey` after refreshing.
+    #[tokio::test]
+    async fn fetch_mint_quotes_by_pubkey_still_fails_when_mint_has_no_pubkey() {
+        let db = create_test_db().await;
+        seed_stale_mint_record(&db).await;
+
+        let mock = Arc::new(MockMintConnector::new());
+        let mut no_pubkey_info = test_mint_info();
+        no_pubkey_info.pubkey = None;
+        no_pubkey_info.time = None;
+        *mock.mint_info.lock().unwrap() = no_pubkey_info;
+        let wallet = create_test_wallet_with_mock(db, mock.clone()).await;
+
+        let secret_key = SecretKey::generate();
+        let err = wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key), false)
+            .await
+            .expect_err("a mint without a pubkey cannot serve the lookup");
+
+        assert!(matches!(err, Error::MissingPubkey));
+        assert!(
+            *mock.get_mint_info_calls.lock().unwrap() >= 1,
+            "the refresh must have been attempted before giving up"
         );
     }
 
