@@ -133,10 +133,18 @@ pub trait MintConnector: Debug {
         quote_id: &str,
     ) -> Result<MintQuoteResponse<String>, Error>;
 
-    /// NUT-XX: Mint Quote Lookup by Public Key
+    /// Look up mint quotes locked to a set of NUT-20 public keys [NUT-XX]
+    ///
+    /// Method-agnostic: quotes for any payment method locked to any of the requested pubkeys
+    /// are returned together. The caller must already have signed `request.pubkey_signatures`
+    /// (one signature per pubkey, over `nutxx::mint_quote_lookup_msg_to_sign`).
+    ///
+    /// A malformed entry in the response (currently, a quote missing its `method` field) is
+    /// skipped with a `tracing::warn!` rather than failing the whole lookup. As a consequence,
+    /// a response whose entries are all malformed yields `Ok(vec![])`, indistinguishable from
+    /// a pubkey with no quotes except by the emitted warnings (per-entry plus a summary count).
     async fn post_mint_quote_by_pubkey(
         &self,
-        method: PaymentMethod,
         request: MintQuoteByPubkeyRequest,
     ) -> Result<Vec<MintQuoteResponse<String>>, Error>;
 

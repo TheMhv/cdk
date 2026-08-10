@@ -471,6 +471,9 @@ pub struct MockMintConnector {
     pub post_batch_mint_responses: Mutex<std::collections::VecDeque<Result<MintResponse, Error>>>,
     /// Captured post_batch_mint requests.
     pub post_batch_mint_requests: Mutex<Vec<(PaymentMethod, BatchMintRequest<String>)>>,
+    /// Response for post_mint_quote_by_pubkey calls
+    pub post_mint_quote_by_pubkey_response:
+        Mutex<Option<Result<Vec<MintQuoteResponse<String>>, Error>>>,
     /// Response for post_swap calls
     pub post_swap_response: Mutex<Option<Result<SwapResponse, Error>>>,
     /// Queue of responses for successive post_swap calls.
@@ -518,6 +521,7 @@ impl MockMintConnector {
             post_mint_requests: Mutex::new(Vec::new()),
             post_batch_mint_responses: Mutex::new(std::collections::VecDeque::new()),
             post_batch_mint_requests: Mutex::new(Vec::new()),
+            post_mint_quote_by_pubkey_response: Mutex::new(None),
             post_swap_response: Mutex::new(None),
             post_swap_responses: Mutex::new(std::collections::VecDeque::new()),
             captured_swap_requests: Mutex::new(Vec::new()),
@@ -765,7 +769,6 @@ impl MintConnector for MockMintConnector {
 
     async fn post_mint_quote_by_pubkey(
         &self,
-        _method: PaymentMethod,
         _request: MintQuoteByPubkeyRequest,
     ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
         self.post_mint_quote_by_pubkey_response
