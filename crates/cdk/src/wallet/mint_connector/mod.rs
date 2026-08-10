@@ -137,7 +137,10 @@ pub trait MintConnector: Debug {
     ///
     /// Method-agnostic: quotes for any payment method locked to any of the requested pubkeys
     /// are returned together. The caller must already have signed `request.pubkey_signatures`
-    /// (one signature per pubkey, over `nutxx::mint_quote_lookup_msg_to_sign`).
+    /// (one signature per pubkey, over `nutxx::mint_quote_lookup_msg_to_sign`) — this is the
+    /// low-level transport call;
+    /// [`Wallet::fetch_mint_quotes_by_pubkey`](crate::Wallet::fetch_mint_quotes_by_pubkey) is the
+    /// signing, storing entry point most callers want.
     ///
     /// A malformed entry in the response (currently, a quote missing its `method` field) is
     /// skipped with a `tracing::warn!` rather than failing the whole lookup. As a consequence,

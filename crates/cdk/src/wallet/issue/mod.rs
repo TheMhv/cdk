@@ -4,18 +4,23 @@
 
 pub(crate) mod saga;
 
+use std::collections::HashMap;
+
 use cdk_common::nut00::KnownMethod;
 use cdk_common::nut04::MintMethodOptions;
+use cdk_common::nutxx::{
+    mint_quote_lookup_msg_to_sign, MintQuoteByPubkeyRequest, MAX_LOOKUP_PUBKEYS,
+};
 use cdk_common::{MintQuoteRequest, MintQuoteResponse, PaymentMethod};
 pub(crate) use saga::MintSaga;
 use tracing::instrument;
 
 use crate::amount::SplitTarget;
-use crate::nuts::{BatchCheckMintQuoteRequest, Proofs, SecretKey, SpendingConditions};
+use crate::nuts::{BatchCheckMintQuoteRequest, Proofs, PublicKey, SecretKey, SpendingConditions};
 use crate::util::unix_time;
 use crate::wallet::recovery::RecoveryAction;
 use crate::wallet::{MintQuote, MintQuoteState};
-use crate::{Amount, Error, Wallet};
+use crate::{ensure_cdk, Amount, Error, Wallet};
 
 pub(crate) fn apply_mint_quote_response(
     quote: &mut MintQuote,
@@ -146,6 +151,51 @@ fn mint_quote_response_amount(response: &MintQuoteResponse<String>) -> Option<Am
         MintQuoteResponse::Custom { response: r, .. } => r.amount,
         MintQuoteResponse::Onchain(_) => None,
     }
+}
+
+/// Returns the NUT-20 pubkey a mint quote response is locked to, if any, across all payment
+/// methods. Bolt12 and Onchain quotes require a pubkey at request time so their response always
+/// carries one; Bolt11 and Custom quotes may be unlocked, so theirs is optional.
+fn mint_quote_response_pubkey(response: &MintQuoteResponse<String>) -> Option<PublicKey> {
+    match response {
+        MintQuoteResponse::Bolt11(r) => r.pubkey,
+        MintQuoteResponse::Bolt12(r) => Some(r.pubkey),
+        MintQuoteResponse::Onchain(r) => Some(r.pubkey),
+        MintQuoteResponse::Custom { response: r, .. } => r.pubkey,
+    }
+}
+
+/// Build the signed [NUT-XX] request that proves control of `secret_keys` to `mint_pubkey`.
+///
+/// One signature is produced per key, over `mint_quote_lookup_msg_to_sign(mint_pubkey, pubkey)`.
+fn build_mint_quote_by_pubkey_request(
+    mint_pubkey: &PublicKey,
+    secret_keys: &[SecretKey],
+) -> Result<MintQuoteByPubkeyRequest, Error> {
+    ensure_cdk!(
+        secret_keys.len() <= MAX_LOOKUP_PUBKEYS,
+        Error::BatchSizeExceeded {
+            actual: secret_keys.len(),
+            max: MAX_LOOKUP_PUBKEYS,
+        }
+    );
+
+    let mut pubkeys = Vec::with_capacity(secret_keys.len());
+    let mut pubkey_signatures = Vec::with_capacity(secret_keys.len());
+
+    for secret_key in secret_keys {
+        let pubkey = secret_key.public_key();
+        let msg = mint_quote_lookup_msg_to_sign(mint_pubkey, &pubkey);
+        let signature = secret_key.sign(&msg)?;
+
+        pubkeys.push(pubkey);
+        pubkey_signatures.push(signature);
+    }
+
+    Ok(MintQuoteByPubkeyRequest {
+        pubkeys,
+        pubkey_signatures,
+    })
 }
 
 impl Wallet {
@@ -652,6 +702,142 @@ impl Wallet {
         Ok(quotes)
     }
 
+    /// Look up this wallet's mint quotes locked to the given NUT-20 keys ([NUT-XX]), storing
+    /// the results in the local database.
+    ///
+    /// Fetches the mint's NUT-06 pubkey, signs the per-key lookup challenge for each of
+    /// `secret_keys` (deduplicated by public key first, so repeated keys don't burn slots of
+    /// the `MAX_LOOKUP_PUBKEYS` request budget), and queries the mint. The mint answers with
+    /// every quote it holds for any of the keys regardless of payment method, so the result
+    /// may mix Bolt11/Bolt12/Onchain/Custom quotes.
+    ///
+    /// Each accepted quote is reconciled into local storage with the same merge/accounting
+    /// logic as [`Wallet::fetch_mint_quote`]: an existing record is updated in place, an
+    /// unseen quote is inserted fresh, and the signing key is stamped on the stored record.
+    /// Unlike `fetch_mint_quote`, which writes back unconditionally, writes here are skipped
+    /// when nothing changed, so a caller polling on an interval does not rewrite
+    /// already-current quotes on every pass.
+    ///
+    /// Every returned quote is validated against the keys that were actually requested: a
+    /// quote whose `pubkey` is missing or was not asked for is logged and dropped rather than
+    /// stored, since this method writes mint responses to the wallet's database and cannot
+    /// take the mint's word for which pubkeys they belong to.
+    ///
+    /// # Errors
+    /// Returns `Ok(vec![])` without contacting the mint if `secret_keys` is empty. Returns
+    /// `Error::BatchSizeExceeded` if the deduplicated key set is longer than
+    /// `MAX_LOOKUP_PUBKEYS`; splitting a larger set into chunks and issuing one call per
+    /// chunk is the caller's responsibility. Returns `Error::MissingPubkey` if the mint does
+    /// not advertise a NUT-06 pubkey.
+    #[instrument(skip(self, secret_keys))]
+    pub async fn fetch_mint_quotes_by_pubkey(
+        &self,
+        secret_keys: &[SecretKey],
+    ) -> Result<Vec<MintQuote>, Error> {
+        if secret_keys.is_empty() {
+            return Ok(Vec::new());
+        }
+
+        // Dedupe by pubkey before building the request: duplicate keys would otherwise burn
+        // slots of the `MAX_LOOKUP_PUBKEYS` request budget for no benefit.
+        let mut requested: HashMap<PublicKey, SecretKey> =
+            HashMap::with_capacity(secret_keys.len());
+        for secret_key in secret_keys {
+            requested
+                .entry(secret_key.public_key())
+                .or_insert_with(|| secret_key.clone());
+        }
+        let deduped_keys: Vec<SecretKey> = requested.values().cloned().collect();
+
+        let mint_pubkey = self
+            .load_mint_info()
+            .await?
+            .pubkey
+            .ok_or(Error::MissingPubkey)?;
+
+        let request = build_mint_quote_by_pubkey_request(&mint_pubkey, &deduped_keys)?;
+        let responses = self.client.post_mint_quote_by_pubkey(request).await?;
+
+        let mut quotes = Vec::with_capacity(responses.len());
+        for response in responses {
+            let quote_id = response.quote().to_string();
+
+            let matching_key = match mint_quote_response_pubkey(&response)
+                .and_then(|pubkey| requested.get(&pubkey))
+            {
+                Some(key) => key.clone(),
+                None => {
+                    tracing::warn!(
+                        "Dropping mint quote {quote_id} returned for a pubkey that was not requested"
+                    );
+                    continue;
+                }
+            };
+
+            let existing_quote = self.localstore.get_mint_quote(&quote_id).await?;
+
+            let (mut quote, mut changed) = match existing_quote {
+                Some(mut existing) => {
+                    // `apply_mint_quote_response`'s bool return means "not stale", not
+                    // "changed": it also reports true for a response that repeats exactly
+                    // what is already stored. Compare the fields it can touch before and
+                    // after instead, so an identical repeat - the steady-state case for a
+                    // poller - skips the write.
+                    let before = (
+                        existing.state,
+                        existing.amount_paid,
+                        existing.amount_issued,
+                        existing.updated_at,
+                    );
+                    apply_mint_quote_response(&mut existing, &response);
+                    let changed = before
+                        != (
+                            existing.state,
+                            existing.amount_paid,
+                            existing.amount_issued,
+                            existing.updated_at,
+                        );
+                    (existing, changed)
+                }
+                None => {
+                    let amount = mint_quote_response_amount(&response);
+                    let unit = match &response {
+                        MintQuoteResponse::Bolt11(r) => r.unit.clone(),
+                        MintQuoteResponse::Bolt12(r) => Some(r.unit.clone()),
+                        MintQuoteResponse::Custom { response: r, .. } => r.unit.clone(),
+                        MintQuoteResponse::Onchain(r) => Some(r.unit.clone()),
+                    };
+                    let mut quote = MintQuote::new(
+                        quote_id,
+                        self.mint_url.clone(),
+                        response.method(),
+                        amount,
+                        unit.unwrap_or(self.unit.clone()),
+                        response.request().to_string(),
+                        response.expiry().unwrap_or(0),
+                        None,
+                    );
+                    apply_mint_quote_response(&mut quote, &response);
+                    // A freshly constructed record is always new to the store.
+                    (quote, true)
+                }
+            };
+
+            if quote.secret_key.as_ref() != Some(&matching_key) {
+                quote.secret_key = Some(matching_key);
+                changed = true;
+            }
+
+            if changed {
+                self.localstore.add_mint_quote(quote.clone()).await?;
+            }
+
+            quotes.push(quote);
+        }
+
+        Ok(quotes)
+    }
+
     /// Mint tokens for multiple quotes in a single batch operation.
     ///
     /// Calls `POST /v1/mint/{method}/batch` per NUT-29.
@@ -693,11 +879,334 @@ impl Wallet {
 #[cfg(test)]
 mod tests {
     use std::str::FromStr;
+    use std::sync::Arc;
 
     use cdk_common::mint_url::MintUrl;
     use cdk_common::nuts::CurrencyUnit;
 
     use super::*;
+    use crate::wallet::test_utils::{
+        create_test_db, create_test_wallet_with_mock, MockMintConnector,
+    };
+
+    #[test]
+    fn mint_quote_by_pubkey_request_signs_and_verifies() {
+        let mint_pubkey = SecretKey::generate().public_key();
+        let secret_keys = vec![SecretKey::generate(), SecretKey::generate()];
+
+        let request = build_mint_quote_by_pubkey_request(&mint_pubkey, &secret_keys)
+            .expect("request should build for a small key set");
+
+        assert_eq!(request.pubkeys.len(), secret_keys.len());
+        assert_eq!(request.pubkey_signatures.len(), secret_keys.len());
+
+        for ((secret_key, pubkey), signature) in secret_keys
+            .iter()
+            .zip(request.pubkeys.iter())
+            .zip(request.pubkey_signatures.iter())
+        {
+            assert_eq!(*pubkey, secret_key.public_key());
+
+            // Round-trip: the signature must verify against the same preimage the mint checks.
+            let msg = mint_quote_lookup_msg_to_sign(&mint_pubkey, pubkey);
+            assert!(pubkey.verify(&msg, signature).is_ok());
+
+            // And it must not verify against a different mint's preimage (mint-bound).
+            let other_mint_pubkey = SecretKey::generate().public_key();
+            let other_msg = mint_quote_lookup_msg_to_sign(&other_mint_pubkey, pubkey);
+            assert!(pubkey.verify(&other_msg, signature).is_err());
+        }
+    }
+
+    #[test]
+    fn mint_quote_by_pubkey_request_rejects_oversized_batch() {
+        let mint_pubkey = SecretKey::generate().public_key();
+        let secret_keys: Vec<SecretKey> = (0..=MAX_LOOKUP_PUBKEYS)
+            .map(|_| SecretKey::generate())
+            .collect();
+
+        let result = build_mint_quote_by_pubkey_request(&mint_pubkey, &secret_keys);
+        assert!(matches!(
+            result,
+            Err(Error::BatchSizeExceeded { actual, max })
+                if actual == secret_keys.len() && max == MAX_LOOKUP_PUBKEYS
+        ));
+    }
+
+    /// `Wallet::fetch_mint_quotes_by_pubkey` against a mock connector: the mint pubkey comes
+    /// from mint info, the request the connector receives carries a valid mint-bound signature
+    /// over the wallet's own pubkey, and the mocked response is stored and returned as a
+    /// `MintQuote` record with the signing key stamped.
+    #[tokio::test]
+    async fn fetch_mint_quotes_by_pubkey_signs_stores_and_returns_mock_response() {
+        let db = create_test_db().await;
+        let mock = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db, mock.clone()).await;
+
+        let mint_pubkey = wallet
+            .load_mint_info()
+            .await
+            .expect("mock mint info")
+            .pubkey
+            .expect("mock mint info has a pubkey");
+
+        let secret_key = SecretKey::generate();
+        let canned_response = vec![MintQuoteResponse::Bolt11(
+            cdk_common::nut23::MintQuoteBolt11Response {
+                quote: "quote-id".to_string(),
+                request: "lnbc1...".to_string(),
+                amount: Some(Amount::from(100)),
+                unit: Some(CurrencyUnit::Sat),
+                method: PaymentMethod::Known(KnownMethod::Bolt11),
+                amount_paid: Amount::ZERO,
+                amount_issued: Amount::ZERO,
+                updated_at: 0,
+                state: MintQuoteState::Unpaid,
+                expiry: None,
+                pubkey: Some(secret_key.public_key()),
+            },
+        )];
+        mock.set_mint_quote_by_pubkey_response(Ok(canned_response));
+
+        let quotes = wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key))
+            .await
+            .expect("lookup should succeed");
+
+        assert_eq!(quotes.len(), 1);
+        assert_eq!(quotes[0].id, "quote-id");
+        assert_eq!(quotes[0].secret_key, Some(secret_key.clone()));
+
+        let stored = wallet
+            .localstore
+            .get_mint_quote("quote-id")
+            .await
+            .expect("localstore read")
+            .expect("quote should be stored locally after lookup");
+        assert_eq!(stored, quotes[0]);
+
+        let captured = mock.captured_mint_quote_by_pubkey_requests.lock().unwrap();
+        assert_eq!(captured.len(), 1);
+        let sent = &captured[0];
+        assert_eq!(sent.pubkeys, vec![secret_key.public_key()]);
+        assert_eq!(sent.pubkey_signatures.len(), 1);
+
+        let msg = mint_quote_lookup_msg_to_sign(&mint_pubkey, &secret_key.public_key());
+        assert!(secret_key
+            .public_key()
+            .verify(&msg, &sent.pubkey_signatures[0])
+            .is_ok());
+    }
+
+    /// A quote returned for a pubkey the wallet did not request must be dropped, not
+    /// stored: the response pubkey selects which local secret key gets stamped onto the
+    /// stored quote (and later signs the NUT-20 mint request), so an entry matching no
+    /// requested key has no key to bind and would persist as an unmintable row. The mint
+    /// stays authoritative for quote state - this check only correlates entries back to
+    /// the request.
+    #[tokio::test]
+    async fn fetch_mint_quotes_by_pubkey_drops_quote_for_unrequested_pubkey() {
+        let db = create_test_db().await;
+        let mock = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db, mock.clone()).await;
+
+        let requested_key = SecretKey::generate();
+        let unrequested_pubkey = SecretKey::generate().public_key();
+
+        let canned_response = vec![MintQuoteResponse::Bolt11(
+            cdk_common::nut23::MintQuoteBolt11Response {
+                quote: "unrequested-quote-id".to_string(),
+                request: "lnbc1...".to_string(),
+                amount: Some(Amount::from(100)),
+                unit: Some(CurrencyUnit::Sat),
+                method: PaymentMethod::Known(KnownMethod::Bolt11),
+                amount_paid: Amount::from(100),
+                amount_issued: Amount::ZERO,
+                updated_at: 0,
+                state: MintQuoteState::Paid,
+                expiry: None,
+                pubkey: Some(unrequested_pubkey),
+            },
+        )];
+        mock.set_mint_quote_by_pubkey_response(Ok(canned_response));
+
+        let quotes = wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&requested_key))
+            .await
+            .expect("lookup should succeed even though the returned quote is dropped");
+
+        assert!(
+            quotes.is_empty(),
+            "a quote for an unrequested pubkey must be dropped"
+        );
+        assert!(
+            wallet
+                .localstore
+                .get_mint_quote("unrequested-quote-id")
+                .await
+                .expect("localstore read")
+                .is_none(),
+            "dropped quote must not be written to the local store"
+        );
+    }
+
+    /// A mint with no NUT-06 pubkey cannot be asked to prove quote ownership against, so the
+    /// lookup must fail fast with `Error::MissingPubkey` rather than send a request.
+    #[tokio::test]
+    async fn fetch_mint_quotes_by_pubkey_errors_without_mint_pubkey() {
+        let db = create_test_db().await;
+        let mock = Arc::new(MockMintConnector::new());
+        mock.set_mint_info_response(Ok(cdk_common::nuts::MintInfo::new()));
+        let wallet = create_test_wallet_with_mock(db, mock.clone()).await;
+
+        let secret_key = SecretKey::generate();
+        let result = wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key))
+            .await;
+
+        assert!(matches!(result, Err(Error::MissingPubkey)));
+        assert!(
+            mock.captured_mint_quote_by_pubkey_requests
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "no lookup request should be sent when the mint has no pubkey"
+        );
+    }
+
+    /// Empty `secret_keys` must short-circuit locally before any network call: no mint-info
+    /// fetch, no lookup request. Both mock responses are left unconfigured on purpose, so
+    /// reaching either would panic rather than silently pass.
+    #[tokio::test]
+    async fn fetch_mint_quotes_by_pubkey_empty_keys_makes_no_connector_calls() {
+        let db = create_test_db().await;
+        let mock = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db, mock.clone()).await;
+
+        let quotes = wallet
+            .fetch_mint_quotes_by_pubkey(&[])
+            .await
+            .expect("an empty lookup should succeed without contacting the mint");
+
+        assert!(quotes.is_empty());
+        assert_eq!(
+            *mock.get_mint_info_calls.lock().unwrap(),
+            0,
+            "empty secret_keys must not fetch mint info"
+        );
+        assert!(
+            mock.captured_mint_quote_by_pubkey_requests
+                .lock()
+                .unwrap()
+                .is_empty(),
+            "empty secret_keys must not reach the connector"
+        );
+    }
+
+    /// Calling the lookup twice with an identical mint response must not rewrite the stored
+    /// record: the accounting fields are unchanged and the secret key is already stamped, so
+    /// the guard that gates `add_mint_quote` stays false. A caller polling on an interval
+    /// must not rewrite unchanged history to disk on every pass.
+    ///
+    /// The witness is the quote row's `version`: `add_mint_quote` is an
+    /// optimistic-concurrency write that bumps it on every store, so a skipped write shows up
+    /// as an unchanged version on a fresh read. A positive control - a changed response
+    /// between calls - must still produce a second write, proving the guard is conditional
+    /// rather than a latch.
+    #[tokio::test]
+    async fn fetch_mint_quotes_by_pubkey_is_idempotent_for_an_unchanged_response() {
+        let db = create_test_db().await;
+        let mock = Arc::new(MockMintConnector::new());
+        let wallet = create_test_wallet_with_mock(db, mock.clone()).await;
+
+        let secret_key = SecretKey::generate();
+        let canned_response = |amount_paid: u64, updated_at: u64| {
+            vec![MintQuoteResponse::Bolt11(
+                cdk_common::nut23::MintQuoteBolt11Response {
+                    quote: "repeat-quote-id".to_string(),
+                    request: "lnbc1...".to_string(),
+                    amount: Some(Amount::from(100)),
+                    unit: Some(CurrencyUnit::Sat),
+                    method: PaymentMethod::Known(KnownMethod::Bolt11),
+                    amount_paid: Amount::from(amount_paid),
+                    amount_issued: Amount::ZERO,
+                    updated_at,
+                    state: MintQuoteState::Paid,
+                    expiry: None,
+                    pubkey: Some(secret_key.public_key()),
+                },
+            )]
+        };
+
+        async fn stored_version(wallet: &Wallet) -> u32 {
+            wallet
+                .localstore
+                .get_mint_quote("repeat-quote-id")
+                .await
+                .expect("localstore read")
+                .expect("quote should be stored")
+                .version
+        }
+
+        mock.set_mint_quote_by_pubkey_response(Ok(canned_response(100, 10)));
+        let first = wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key))
+            .await
+            .expect("first lookup should succeed");
+        let version_after_first = stored_version(&wallet).await;
+
+        mock.set_mint_quote_by_pubkey_response(Ok(canned_response(100, 10)));
+        let second = wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key))
+            .await
+            .expect("second lookup should succeed");
+
+        assert_eq!(
+            first, second,
+            "an unchanged mint response must not perturb the stored record"
+        );
+        assert_eq!(
+            stored_version(&wallet).await,
+            version_after_first,
+            "an unchanged response must not trigger a second write"
+        );
+        assert_eq!(
+            mock.captured_mint_quote_by_pubkey_requests
+                .lock()
+                .unwrap()
+                .len(),
+            2,
+            "the connector should still be called on every poll; only the write is guarded"
+        );
+
+        // Positive control: a genuinely changed response must still write through.
+        mock.set_mint_quote_by_pubkey_response(Ok(canned_response(150, 11)));
+        let third = wallet
+            .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key))
+            .await
+            .expect("third lookup should succeed");
+        assert_eq!(third[0].amount_paid, Amount::from(150));
+        assert_eq!(
+            stored_version(&wallet).await,
+            version_after_first.wrapping_add(1),
+            "a genuinely changed response must trigger exactly one more write"
+        );
+
+        // `add_mint_quote` bumps the stored `version` server-side without reflecting it back
+        // into the caller's struct, so compare the fields the response can touch rather than
+        // the full struct.
+        let stored = wallet
+            .localstore
+            .get_mint_quote("repeat-quote-id")
+            .await
+            .expect("localstore read")
+            .expect("quote should be stored");
+        assert_eq!(stored.amount_paid, third[0].amount_paid);
+        assert_eq!(stored.amount_issued, third[0].amount_issued);
+        assert_eq!(stored.updated_at, third[0].updated_at);
+        assert_eq!(stored.state, third[0].state);
+        assert_eq!(stored.secret_key, third[0].secret_key);
+    }
 
     #[test]
     fn local_onchain_mint_quote_amount_is_not_stored() {

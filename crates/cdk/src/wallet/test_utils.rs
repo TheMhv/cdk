@@ -474,6 +474,8 @@ pub struct MockMintConnector {
     /// Response for post_mint_quote_by_pubkey calls
     pub post_mint_quote_by_pubkey_response:
         Mutex<Option<Result<Vec<MintQuoteResponse<String>>, Error>>>,
+    /// Captured post_mint_quote_by_pubkey requests for test verification.
+    pub captured_mint_quote_by_pubkey_requests: Mutex<Vec<MintQuoteByPubkeyRequest>>,
     /// Response for post_swap calls
     pub post_swap_response: Mutex<Option<Result<SwapResponse, Error>>>,
     /// Queue of responses for successive post_swap calls.
@@ -496,6 +498,8 @@ pub struct MockMintConnector {
     /// Response for DNS TXT resolution calls
     #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
     pub dns_txt_response: Mutex<Option<Result<Vec<String>, Error>>>,
+    /// Number of times `get_mint_info` has been called.
+    pub get_mint_info_calls: Mutex<usize>,
 }
 
 impl Default for MockMintConnector {
@@ -522,6 +526,7 @@ impl MockMintConnector {
             post_batch_mint_responses: Mutex::new(std::collections::VecDeque::new()),
             post_batch_mint_requests: Mutex::new(Vec::new()),
             post_mint_quote_by_pubkey_response: Mutex::new(None),
+            captured_mint_quote_by_pubkey_requests: Mutex::new(Vec::new()),
             post_swap_response: Mutex::new(None),
             post_swap_responses: Mutex::new(std::collections::VecDeque::new()),
             captured_swap_requests: Mutex::new(Vec::new()),
@@ -531,6 +536,7 @@ impl MockMintConnector {
             lnurl_invoice_response: Mutex::new(None),
             #[cfg(all(feature = "bip353", not(target_arch = "wasm32")))]
             dns_txt_response: Mutex::new(None),
+            get_mint_info_calls: Mutex::new(0),
         }
     }
 
@@ -585,6 +591,13 @@ impl MockMintConnector {
         }
     }
 
+    pub fn set_mint_quote_by_pubkey_response(
+        &self,
+        response: Result<Vec<MintQuoteResponse<String>>, Error>,
+    ) {
+        *self.post_mint_quote_by_pubkey_response.lock().unwrap() = Some(response);
+    }
+
     pub fn set_active_keyset(&self, keyset: KeySet) {
         *self.keysets.lock().unwrap() = vec![keyset];
     }
@@ -617,13 +630,6 @@ impl MockMintConnector {
             .lock()
             .unwrap()
             .push_back(response);
-    }
-
-    pub fn set_post_mint_quote_by_pubkeys_response(
-        &self,
-        response: Result<Vec<MintQuoteResponse<String>>, Error>,
-    ) {
-        *self.post_mint_quote_by_pubkey_response.lock().unwrap() = Some(response);
     }
 
     pub fn set_post_mint_response(&self, response: Result<MintResponse, Error>) {
@@ -769,8 +775,13 @@ impl MintConnector for MockMintConnector {
 
     async fn post_mint_quote_by_pubkey(
         &self,
-        _request: MintQuoteByPubkeyRequest,
+        request: MintQuoteByPubkeyRequest,
     ) -> Result<Vec<MintQuoteResponse<String>>, Error> {
+        self.captured_mint_quote_by_pubkey_requests
+            .lock()
+            .unwrap()
+            .push(request);
+
         self.post_mint_quote_by_pubkey_response
             .lock()
             .unwrap()
@@ -852,6 +863,7 @@ impl MintConnector for MockMintConnector {
     }
 
     async fn get_mint_info(&self) -> Result<crate::nuts::MintInfo, Error> {
+        *self.get_mint_info_calls.lock().unwrap() += 1;
         Ok(self.mint_info.lock().unwrap().clone())
     }
 
