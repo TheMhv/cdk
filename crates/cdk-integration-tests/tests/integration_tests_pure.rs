@@ -21,6 +21,7 @@ use bip39::Mnemonic;
 use cashu::amount::SplitTarget;
 use cashu::dhke::construct_proofs;
 use cashu::mint_url::MintUrl;
+use cashu::nuts::nut00::KnownMethod;
 use cashu::nuts::nut10::Conditions;
 use cashu::nuts::SigFlag;
 use cashu::{
@@ -39,7 +40,10 @@ use cdk_common::payment::{
     MintPayment, OutgoingPaymentOptions, PaymentIdentifier, PaymentQuoteResponse,
 };
 use cdk_common::wallet::ProofInfo;
-use cdk_common::{MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse};
+use cdk_common::{
+    MeltQuoteCreateResponse, MeltQuoteRequest, MeltQuoteResponse, MintQuoteBolt11Request,
+    MintQuoteRequest,
+};
 use cdk_fake_wallet::create_fake_invoice;
 use cdk_integration_tests::init_pure_tests::*;
 use futures::Stream;
@@ -3698,4 +3702,70 @@ async fn test_p2pk_signing_keys_mixed_locked_and_unlocked_proofs() {
         send_amount, received,
         "Bob should receive exactly the send amount"
     );
+}
+
+/// The wallet signs its own NUT-XX lookup challenge, the mint verifies it, and the wallet gets
+/// back the quote it locked to its own key - then persists it with the signing key stamped,
+/// since callers use this method to populate the wallet database, not just to report results.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_fetch_mint_quotes_by_pubkey_round_trip() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let secret_key = SecretKey::generate();
+    mint.get_mint_quote(MintQuoteRequest::Bolt11(MintQuoteBolt11Request {
+        amount: Amount::from(100).into(),
+        unit: CurrencyUnit::Sat,
+        description: None,
+        pubkey: Some(secret_key.public_key()),
+    }))
+    .await
+    .expect("Failed to create locked quote");
+
+    let wallet = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create test wallet");
+
+    let quotes = wallet
+        .fetch_mint_quotes_by_pubkey(std::slice::from_ref(&secret_key), false)
+        .await
+        .expect("lookup should succeed");
+
+    assert_eq!(quotes.len(), 1);
+    assert_eq!(
+        quotes[0].payment_method,
+        PaymentMethod::Known(KnownMethod::Bolt11)
+    );
+    assert_eq!(quotes[0].secret_key, Some(secret_key));
+
+    // The lookup must have persisted the quote, not just returned it in memory.
+    let stored = wallet
+        .localstore
+        .get_mint_quote(&quotes[0].id)
+        .await
+        .expect("localstore read")
+        .expect("quote should be stored locally after lookup");
+    assert_eq!(stored, quotes[0]);
+}
+
+/// A key with no locked quotes gets back an empty list, not an error - the mint's signature
+/// check passes (the wallet signed correctly) and simply finds nothing for that key.
+#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
+async fn test_fetch_mint_quotes_by_pubkey_empty_for_unused_key() {
+    setup_tracing();
+    let mint = create_and_start_test_mint()
+        .await
+        .expect("Failed to create test mint");
+    let wallet = create_test_wallet_for_mint(mint)
+        .await
+        .expect("Failed to create test wallet");
+
+    let unrelated_key = SecretKey::generate();
+    let quotes = wallet
+        .fetch_mint_quotes_by_pubkey(&[unrelated_key], false)
+        .await
+        .expect("lookup should succeed");
+
+    assert!(quotes.is_empty());
 }
