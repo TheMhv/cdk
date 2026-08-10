@@ -23,6 +23,13 @@ pub struct MintQuoteByPubkeyRequest {
     pub pubkeys: Vec<PublicKey>,
     /// Schnorr signatures, in the same order as `pubkeys`
     pub pubkey_signatures: Vec<Signature>,
+    /// Bound the response to quotes that are still mintable (`amount_issued < amount_paid`)
+    ///
+    /// Opt-in and additive: absent from the wire when `false`, so a mint that predates this
+    /// field sees the request an old client would send, and a client that predates it
+    /// deserializes an incoming request to `false` - unfiltered either way.
+    #[serde(default, skip_serializing_if = "core::ops::Not::not")]
+    pub only_mintable: bool,
 }
 
 /// Mint quote by pubkey response [NUT-XX]
@@ -130,6 +137,7 @@ mod tests {
         let json = serde_json::to_string(&MintQuoteByPubkeyRequest {
             pubkeys: vec![pubkey],
             pubkey_signatures: vec![signature],
+            only_mintable: false,
         })
         .unwrap();
 
@@ -139,6 +147,54 @@ mod tests {
         let request: MintQuoteByPubkeyRequest = serde_json::from_str(&json).unwrap();
         assert_eq!(request.pubkeys, vec![pubkey]);
         assert_eq!(request.pubkey_signatures, vec![signature]);
+        assert!(!request.only_mintable);
+    }
+
+    /// A request from a client built before `only_mintable` existed (the field absent from the
+    /// wire entirely) must still deserialize, defaulting to `false` - the old, unfiltered
+    /// behavior - rather than failing to parse.
+    #[test]
+    fn test_only_mintable_absent_defaults_to_false() {
+        let (mint_pubkey, _) = fixed_keys();
+        let secret_key = SecretKey::generate();
+        let pubkey = secret_key.public_key();
+        let msg = mint_quote_lookup_msg_to_sign(&mint_pubkey, &pubkey);
+        let signature = secret_key.sign(&msg).unwrap();
+
+        let json = serde_json::json!({
+            "pubkeys": [pubkey.to_hex()],
+            "pubkey_signatures": [signature.to_string()],
+        });
+
+        let request: MintQuoteByPubkeyRequest = serde_json::from_value(json).unwrap();
+        assert!(!request.only_mintable);
+    }
+
+    /// `false` is the common case and must be left off the wire entirely, so a mint that
+    /// predates this field parses the request exactly as it did before.
+    #[test]
+    fn test_only_mintable_false_is_not_serialized() {
+        let request = MintQuoteByPubkeyRequest {
+            pubkeys: vec![SecretKey::generate().public_key()],
+            pubkey_signatures: vec![],
+            only_mintable: false,
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert!(value.get("only_mintable").is_none());
+    }
+
+    /// `true` must be sent explicitly so a conforming mint can apply the filter.
+    #[test]
+    fn test_only_mintable_true_is_serialized() {
+        let request = MintQuoteByPubkeyRequest {
+            pubkeys: vec![SecretKey::generate().public_key()],
+            pubkey_signatures: vec![],
+            only_mintable: true,
+        };
+
+        let value = serde_json::to_value(&request).unwrap();
+        assert_eq!(value.get("only_mintable"), Some(&serde_json::json!(true)));
     }
 
     /// The response envelope is an object with a `quotes` array, not a bare array.
